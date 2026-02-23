@@ -35,6 +35,9 @@ pub enum RevoraError {
 
 // ── Event symbols ────────────────────────────────────────────
 const EVENT_REVENUE_REPORTED: Symbol = symbol_short!("rev_rep");
+const EVENT_REVENUE_REPORT_INITIAL: Symbol = symbol_short!("rev_init");
+const EVENT_REVENUE_REPORT_OVERRIDE: Symbol = symbol_short!("rev_ovrd");
+const EVENT_REVENUE_REPORT_REJECTED: Symbol = symbol_short!("rev_rej");
 const EVENT_BL_ADD: Symbol = symbol_short!("bl_add");
 const EVENT_BL_REM: Symbol = symbol_short!("bl_rem");
 const EVENT_CONCENTRATION_WARNING: Symbol = symbol_short!("conc_warn");
@@ -44,6 +47,9 @@ const EVENT_SHARE_SET: Symbol = symbol_short!("share_set");
 const EVENT_FREEZE: Symbol = symbol_short!("freeze");
 const EVENT_CLAIM_DELAY_SET: Symbol = symbol_short!("delay_set");
 const EVENT_TESTNET_MODE: Symbol = symbol_short!("test_mode");
+const EVENT_INIT: Symbol = symbol_short!("init");
+const EVENT_PAUSED: Symbol = symbol_short!("paused");
+const EVENT_UNPAUSED: Symbol = symbol_short!("unpaused");
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -109,6 +115,8 @@ pub enum DataKey {
     AuditSummary(Address, Address),
     /// Per (issuer, token): rounding mode for share math.
     RoundingMode(Address, Address),
+    /// Per (issuer, token): revenue reports map (period_id -> (amount, timestamp)).
+    RevenueReports(Address, Address),
     /// Revenue amount deposited for (offering_token, period_id).
     PeriodRevenue(Address, u64),
     /// Maps (offering_token, sequential_index) -> period_id for enumeration.
@@ -131,6 +139,10 @@ pub enum DataKey {
     Frozen,
     /// Testnet mode flag; when true, enables fee-free/simplified behavior (#24).
     TestnetMode,
+    /// Safety role address for emergency pause (#7).
+    Safety,
+    /// Global pause flag; when true, state-mutating ops are disabled (#7).
+    Paused,
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -159,6 +171,102 @@ impl RevoraRevenueShare {
         Ok(())
     }
 
+    /// Initialize admin and optional safety role for emergency pause (#7).
+    /// Can only be called once; panics if already initialized.
+    pub fn initialize(env: Env, admin: Address, safety: Option<Address>) {
+        if env.storage().persistent().has(&DataKey::Admin) {
+            panic!("already initialized");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Admin, &admin.clone());
+        if let Some(s) = safety.clone() {
+            env.storage().persistent().set(&DataKey::Safety, &s);
+        }
+        env.storage().persistent().set(&DataKey::Paused, &false);
+        env.events().publish((EVENT_INIT, admin.clone()), (safety,));
+    }
+
+    /// Pause the contract (admin only). Idempotent.
+    pub fn pause_admin(env: Env, caller: Address) {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("admin not set");
+        if caller != admin {
+            panic!("not admin");
+        }
+        env.storage().persistent().set(&DataKey::Paused, &true);
+        env.events().publish((EVENT_PAUSED, caller.clone()), ());
+    }
+
+    /// Unpause the contract (admin only). Idempotent.
+    pub fn unpause_admin(env: Env, caller: Address) {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("admin not set");
+        if caller != admin {
+            panic!("not admin");
+        }
+        env.storage().persistent().set(&DataKey::Paused, &false);
+        env.events().publish((EVENT_UNPAUSED, caller.clone()), ());
+    }
+
+    /// Pause the contract (safety role only). Idempotent.
+    pub fn pause_safety(env: Env, caller: Address) {
+        caller.require_auth();
+        let safety: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Safety)
+            .expect("safety not set");
+        if caller != safety {
+            panic!("not safety");
+        }
+        env.storage().persistent().set(&DataKey::Paused, &true);
+        env.events().publish((EVENT_PAUSED, caller.clone()), ());
+    }
+
+    /// Unpause the contract (safety role only). Idempotent.
+    pub fn unpause_safety(env: Env, caller: Address) {
+        caller.require_auth();
+        let safety: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Safety)
+            .expect("safety not set");
+        if caller != safety {
+            panic!("not safety");
+        }
+        env.storage().persistent().set(&DataKey::Paused, &false);
+        env.events().publish((EVENT_UNPAUSED, caller.clone()), ());
+    }
+
+    /// Query the paused state of the contract.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    /// Helper: panic if contract is paused. Used by state-mutating entrypoints.
+    fn require_not_paused(env: &Env) {
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            panic!("contract is paused");
+        }
+    }
+
     /// Register a new revenue-share offering.
     /// Returns `Err(RevoraError::InvalidRevenueShareBps)` if revenue_share_bps > 10000.
     /// In testnet mode, bps validation is skipped to allow flexible testing.
@@ -169,6 +277,7 @@ impl RevoraRevenueShare {
         revenue_share_bps: u32,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env);
         issuer.require_auth();
 
         // Skip bps validation in testnet mode
@@ -223,14 +332,17 @@ impl RevoraRevenueShare {
     /// Record a revenue report for an offering. Updates audit summary (#34).
     /// Fails with `ConcentrationLimitExceeded` (#26) if concentration enforcement is on and current concentration exceeds limit.
     /// In testnet mode, concentration enforcement is skipped.
+    /// `override_existing`: if true, allows overwriting a previously reported period.
     pub fn report_revenue(
         env: Env,
         issuer: Address,
         token: Address,
         amount: i128,
         period_id: u64,
+        override_existing: bool,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env);
         issuer.require_auth();
 
         // Skip concentration enforcement in testnet mode
@@ -255,6 +367,43 @@ impl RevoraRevenueShare {
 
         let blacklist = Self::get_blacklist(env.clone(), token.clone());
 
+        let key = DataKey::RevenueReports(issuer.clone(), token.clone());
+        let mut reports: Map<u64, (i128, u64)> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Map::new(&env));
+        let current_timestamp = env.ledger().timestamp();
+
+        match reports.get(period_id) {
+            Some((existing_amount, _timestamp)) => {
+                if override_existing {
+                    reports.set(period_id, (amount, current_timestamp));
+                    env.storage().persistent().set(&key, &reports);
+
+                    env.events().publish(
+                        (EVENT_REVENUE_REPORT_OVERRIDE, issuer.clone(), token.clone()),
+                        (amount, period_id, existing_amount, blacklist.clone()),
+                    );
+                } else {
+                    env.events().publish(
+                        (EVENT_REVENUE_REPORT_REJECTED, issuer.clone(), token.clone()),
+                        (amount, period_id, existing_amount, blacklist.clone()),
+                    );
+                }
+            }
+            None => {
+                reports.set(period_id, (amount, current_timestamp));
+                env.storage().persistent().set(&key, &reports);
+
+                env.events().publish(
+                    (EVENT_REVENUE_REPORT_INITIAL, issuer.clone(), token.clone()),
+                    (amount, period_id, blacklist.clone()),
+                );
+            }
+        }
+
+        // Backward-compatible event
         env.events().publish(
             (EVENT_REVENUE_REPORTED, issuer.clone(), token.clone()),
             (amount, period_id, blacklist),
@@ -323,6 +472,7 @@ impl RevoraRevenueShare {
         investor: Address,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env);
         caller.require_auth();
 
         let key = DataKey::Blacklist(token.clone());
@@ -348,6 +498,7 @@ impl RevoraRevenueShare {
         investor: Address,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env);
         caller.require_auth();
 
         let key = DataKey::Blacklist(token.clone());
