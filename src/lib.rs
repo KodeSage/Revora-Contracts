@@ -19,6 +19,9 @@ pub enum RevoraError {
 
 // ── Event symbols ────────────────────────────────────────────
 const EVENT_REVENUE_REPORTED: Symbol = symbol_short!("rev_rep");
+const EVENT_REVENUE_REPORT_INITIAL: Symbol = symbol_short!("rev_init");
+const EVENT_REVENUE_REPORT_OVERRIDE: Symbol = symbol_short!("rev_ovrd");
+const EVENT_REVENUE_REPORT_REJECTED: Symbol = symbol_short!("rev_rej");
 const EVENT_BL_ADD: Symbol = symbol_short!("bl_add");
 const EVENT_BL_REM: Symbol = symbol_short!("bl_rem");
 const EVENT_CONCENTRATION_WARNING: Symbol = symbol_short!("conc_warn");
@@ -74,6 +77,8 @@ pub enum DataKey {
     AuditSummary(Address, Address),
     /// Per (issuer, token): rounding mode for share math.
     RoundingMode(Address, Address),
+    /// Per (issuer, token): revenue reports map (period_id -> (amount, timestamp)).
+    RevenueReports(Address, Address),
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -143,12 +148,14 @@ impl RevoraRevenueShare {
 
     /// Record a revenue report for an offering. Updates audit summary (#34).
     /// Fails with `ConcentrationLimitExceeded` (#26) if concentration enforcement is on and current concentration exceeds limit.
+    /// `override_existing`: if true, allows overwriting a previously reported period.
     pub fn report_revenue(
         env: Env,
         issuer: Address,
         token: Address,
         amount: i128,
         period_id: u64,
+        override_existing: bool,
     ) -> Result<(), RevoraError> {
         issuer.require_auth();
 
@@ -170,46 +177,43 @@ impl RevoraRevenueShare {
 
         let blacklist = Self::get_blacklist(env.clone(), token.clone());
 
+        let key = DataKey::RevenueReports(issuer.clone(), token.clone());
+        let mut reports: Map<u64, (i128, u64)> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Map::new(&env));
         let current_timestamp = env.ledger().timestamp();
-        
+
         match reports.get(period_id) {
             Some((existing_amount, _timestamp)) => {
                 if override_existing {
-                    // Allow override with explicit intent
                     reports.set(period_id, (amount, current_timestamp));
                     env.storage().persistent().set(&key, &reports);
-                    
-                    let blacklist = Self::get_blacklist(env.clone(), token.clone());
+
                     env.events().publish(
                         (EVENT_REVENUE_REPORT_OVERRIDE, issuer.clone(), token.clone()),
-                        (amount, period_id, existing_amount, blacklist),
+                        (amount, period_id, existing_amount, blacklist.clone()),
                     );
                 } else {
-                    // Reject duplicate report
-                    let blacklist = Self::get_blacklist(env.clone(), token.clone());
                     env.events().publish(
                         (EVENT_REVENUE_REPORT_REJECTED, issuer.clone(), token.clone()),
-                        (amount, period_id, existing_amount, blacklist),
+                        (amount, period_id, existing_amount, blacklist.clone()),
                     );
-                    // Note: In production, you might want to revert the transaction here
-                    // For now, we emit a rejection event and continue
                 }
             }
             None => {
-                // First time reporting this period
                 reports.set(period_id, (amount, current_timestamp));
                 env.storage().persistent().set(&key, &reports);
-                
-                let blacklist = Self::get_blacklist(env.clone(), token.clone());
+
                 env.events().publish(
                     (EVENT_REVENUE_REPORT_INITIAL, issuer.clone(), token.clone()),
-                    (amount, period_id, blacklist),
+                    (amount, period_id, blacklist.clone()),
                 );
             }
         }
 
-        // Maintain backward compatibility with existing event
-        let blacklist = Self::get_blacklist(env.clone(), token.clone());
+        // Backward-compatible event
         env.events().publish(
             (EVENT_REVENUE_REPORTED, issuer.clone(), token.clone()),
             (amount, period_id, blacklist),
